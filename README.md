@@ -70,13 +70,15 @@ Large Clarity files may be slow or memory-heavy when written with `to_excel`; th
 
 Variable **`INPUT_DIR`** (default `input`): where prefixed files are discovered. Example: `make run-all INPUT_DIR=/path/to/data`.
 
+**Terminal output:** `condense`, `enrich`, and `verify` use the same style (banner, dim step lines, green **DONE** / **PASSED** or red **FAILED**). ANSI colors apply when stdout is a TTY; set `NO_COLOR=1` or pass `--no-color` on any script to disable. During verify, the row-comparison progress bar only runs on a TTY; use `--no-progress` to turn it off.
+
 ## Verify enriched Clarity (`verify_enrich.py`)
 
-After `make enrich`, run **`make verify`**: it loads the raw Clarity file and the SEAGM diary from `input/`, runs the same `merge_asof` logic as `enrich_clarity.py`, and compares `At Sea`, `At Work`, and `Glucose Issue` row-by-row to the enriched workbook in `output/` (default: `<Clarity_stem>_diary.xlsx`). Exit code `0` means match; `1` means mismatches (details on stderr); `2` if the enriched file is missing.
+**`make verify`** loads the raw Clarity file and the SEAGM diary from `input/`, recomputes the same `merge_asof` merge as `enrich_clarity.py`, and compares `At Sea`, `At Work`, and `Glucose Issue` row-by-row to the enriched workbook in `output/` (default: `<Clarity_stem>_diary.xlsx`). Use it after `make enrich`, or rely on **`make run-all`**, which ends with verify.
+
+Exit codes: **`0`** — all rows match; **`1`** — mismatches (sample lines printed in the report); **`2`** — enriched file missing (short error on stderr).
 
 Override paths: `python scripts/verify_enrich.py -d diary.xlsx -c raw.xlsx -e out/enriched.xlsx`.
-
-`condense_diary.py` and `enrich_clarity.py` print the same framed banner style (dim steps, green **DONE**). The verify script prints a framed report (match rate %, green PASSED / red FAILED). Colors use ANSI when stdout is a TTY; set `NO_COLOR=1` or pass `--no-color` on any of these scripts to disable. The row-comparison progress bar only runs on a TTY (so `make verify` logs stay compact); use `--no-progress` to force it off in a terminal.
 
 ## Manual commands
 
@@ -86,7 +88,7 @@ Auto-pick from `input/`:
 python scripts/condense_diary.py --input-dir input -o output/diary_intervals.xlsx --gap-hours 1
 
 python scripts/enrich_clarity.py --input-dir input --output-dir output
-# writes e.g. output/Clarity_Export_SeaGM03_JF_2026-03-11_162431_diary.xlsx
+# writes output/<Clarity_filename_stem>_diary.xlsx (see table above)
 ```
 
 Explicit paths (optional):
@@ -107,4 +109,4 @@ Expected column: `Timestamp (YYYY-MM-DDThh:mm:ss)`, plus `Submitted`, `At Sea`, 
 
 ## Data handling
 
-Do not commit identifiable health data to a public repository unless your study protocol allows it.
+By default, files under `input/` and `output/` are gitignored (the directories stay in the repo with `.gitkeep`). Do not commit identifiable health data to a public repository unless your study protocol allows it.
