@@ -14,6 +14,11 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from diary_load import TIMESTAMP_COL, load_clean_diary  # noqa: E402
+from input_resolve import find_unique_by_prefix  # noqa: E402
+from term import Term, print_run_footer, print_run_header, use_color  # noqa: E402
+
+DIARY_PREFIX = "SEAGM"
+CLARITY_PREFIX = "Clarity_Export"
 
 CLARITY_TS_COL = TIMESTAMP_COL
 DIARY_COLS = ["At Sea", "At Work", "Glucose Issue"]
@@ -111,17 +116,76 @@ def enrich_clarity(clarity: pd.DataFrame, diary: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--diary", "-d", required=True, help="Diary .xlsx path")
-    p.add_argument("--clarity", "-c", required=True, help="Clarity export .xlsx path")
-    p.add_argument("--output", "-o", required=True, help="Output .xlsx path")
+    p.add_argument(
+        "--diary",
+        "-d",
+        default=None,
+        help=f"Diary .xlsx path (default: sole file starting with {DIARY_PREFIX!r} under --input-dir)",
+    )
+    p.add_argument(
+        "--clarity",
+        "-c",
+        default=None,
+        help=f"Clarity export .xlsx path (default: sole file starting with {CLARITY_PREFIX!r} under --input-dir)",
+    )
+    p.add_argument(
+        "--input-dir",
+        default="input",
+        help="Directory to search when -d and/or -c is omitted (default: input)",
+    )
+    p.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        help="Output .xlsx path (if omitted, use --output-dir and name like <Clarity_stem>_diary.xlsx)",
+    )
+    p.add_argument(
+        "--output-dir",
+        default=None,
+        help="Write <Clarity_filename_stem>_diary.xlsx here (required if -o is omitted)",
+    )
+    p.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     args = p.parse_args()
 
-    _require_excel_out(args.diary, "Diary")
-    _require_excel_out(args.clarity, "Clarity")
-    _require_excel_out(args.output, "Output")
+    term = Term(use_color(no_color_flag=args.no_color))
 
-    diary = load_clean_diary(args.diary)
-    clarity = pd.read_excel(args.clarity, engine="openpyxl")
+    diary_path = (
+        Path(args.diary)
+        if args.diary is not None
+        else find_unique_by_prefix(args.input_dir, DIARY_PREFIX, label="Diary")
+    )
+    clarity_path = (
+        Path(args.clarity)
+        if args.clarity is not None
+        else find_unique_by_prefix(args.input_dir, CLARITY_PREFIX, label="Clarity export")
+    )
+
+    _require_excel_out(str(diary_path), "Diary")
+    _require_excel_out(str(clarity_path), "Clarity")
+
+    if args.output is not None:
+        out_path = Path(args.output)
+    elif args.output_dir is not None:
+        out_dir = Path(args.output_dir)
+        suffix = clarity_path.suffix.lower()
+        if suffix not in (".xlsx", ".xlsm"):
+            suffix = ".xlsx"
+        out_path = out_dir / f"{clarity_path.stem}_diary{suffix}"
+    else:
+        p.error("Provide either --output (-o) or --output-dir")
+
+    _require_excel_out(str(out_path), "Output")
+
+    print_run_header(term, "Clarity enrich (merge diary)")
+    print(f"  {term.dim('Diary:')}     {diary_path.name}")
+    print(f"  {term.dim('Clarity:')}   {clarity_path.name}")
+    print(f"  {term.dim('Output:')}    {out_path.name}")
+    print()
+
+    print(term.dim("  Loading diary…"))
+    diary = load_clean_diary(str(diary_path))
+    print(term.dim("  Loading Clarity export…"))
+    clarity = pd.read_excel(clarity_path, engine="openpyxl")
 
     if CLARITY_TS_COL not in clarity.columns:
         raise KeyError(
@@ -135,15 +199,27 @@ def main() -> None:
     first_diary = diary["ts"].min()
     if pd.notna(first_clarity) and first_clarity < first_diary:
         print(
-            f"Warning: first Clarity timestamp {first_clarity} is before first diary {first_diary}; "
-            "those rows will have empty diary columns.",
+            term.yellow(
+                f"  Warning: first Clarity timestamp {first_clarity} is before first diary {first_diary}; "
+                "those rows will have empty diary columns."
+            ),
             file=sys.stderr,
         )
 
+    print(term.dim("  Merging (merge_asof backward on timestamps)…"))
     enriched = enrich_clarity(clarity, diary)
-    out_path = Path(args.output)
+    print(term.dim("  Writing enriched workbook…"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     enriched.to_excel(out_path, index=False, engine="openpyxl")
+
+    n = len(enriched)
+    with_ts = pd.to_datetime(enriched[CLARITY_TS_COL], errors="coerce").notna().sum()
+    print()
+    print(f"  {term.dim('Output rows:')}   {n:,}  ({term.dim('with timestamp:')} {int(with_ts):,})")
+    print()
+    print(term.green(term.bold("  ✓ DONE")))
+    print(term.green(f"  Wrote {out_path.name}"))
+    print_run_footer(term)
 
 
 if __name__ == "__main__":

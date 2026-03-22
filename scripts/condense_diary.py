@@ -14,6 +14,10 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from diary_load import load_clean_diary  # noqa: E402
+from input_resolve import find_unique_by_prefix  # noqa: E402
+from term import Term, print_run_footer, print_run_header, use_color  # noqa: E402
+
+DIARY_PREFIX = "SEAGM"
 
 
 def _bool_to_diary_str(b: bool) -> str:
@@ -120,7 +124,17 @@ def build_intervals(diary: pd.DataFrame, *, gap: pd.Timedelta) -> tuple[pd.DataF
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--input", "-i", required=True, help="Diary .xlsx path")
+    p.add_argument(
+        "--input",
+        "-i",
+        default=None,
+        help=f"Diary .xlsx path (default: sole file starting with {DIARY_PREFIX!r} under --input-dir)",
+    )
+    p.add_argument(
+        "--input-dir",
+        default="input",
+        help="Directory to search when -i is omitted (default: input)",
+    )
     p.add_argument(
         "--output",
         "-o",
@@ -134,18 +148,46 @@ def main() -> None:
         metavar="H",
         help="If consecutive diary rows differ by more than H hours, close all intervals at the earlier row (default: 1.0)",
     )
+    p.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     args = p.parse_args()
 
-    gap = pd.Timedelta(hours=args.gap_hours)
-    diary = load_clean_diary(args.input)
-    sea, work, issues = build_intervals(diary, gap=gap)
+    term = Term(use_color(no_color_flag=args.no_color))
 
+    diary_path = (
+        Path(args.input)
+        if args.input is not None
+        else find_unique_by_prefix(args.input_dir, DIARY_PREFIX, label="Diary")
+    )
     out_path = Path(args.output)
+
+    print_run_header(term, "Diary intervals (condense)")
+    print(f"  {term.dim('Diary:')}     {diary_path.name}")
+    print(f"  {term.dim('Output:')}    {out_path.name}")
+    print(f"  {term.dim('Gap rule:')}  close all intervals if step exceeds {args.gap_hours:g} h")
+    print()
+
+    print(term.dim("  Loading & cleaning diary…"))
+    gap = pd.Timedelta(hours=args.gap_hours)
+    diary = load_clean_diary(str(diary_path))
+    print(term.dim("  Building sea / work / glucose interval tables…"))
+    sea, work, issues = build_intervals(diary, gap=gap)
+    print(term.dim("  Writing workbook (3 sheets)…"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         sea.to_excel(writer, sheet_name="at_sea", index=False)
         work.to_excel(writer, sheet_name="at_work", index=False)
         issues.to_excel(writer, sheet_name="glucose_issues", index=False)
+
+    print()
+    print(f"  {term.dim('Diary rows:')}     {len(diary):,}")
+    print(
+        f"  {term.dim('Intervals:')}     "
+        f"at_sea={len(sea):,}, at_work={len(work):,}, glucose_issues={len(issues):,}"
+    )
+    print()
+    print(term.green(term.bold("  ✓ DONE")))
+    print(term.green(f"  Wrote {out_path.name}"))
+    print_run_footer(term)
 
 
 if __name__ == "__main__":
