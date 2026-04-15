@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from openpyxl import load_workbook
 
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
@@ -33,6 +34,9 @@ def _norm_cell(x) -> str:
         return ""
     if isinstance(x, float) and pd.isna(x):
         return ""
+    if isinstance(x, (float, np.floating)) and not pd.isna(x):
+        if float(x).is_integer():
+            return str(int(x))
     s = str(x).strip()
     if s.lower() == "nan":
         return ""
@@ -71,6 +75,95 @@ class VerifyOutcome:
     mismatch_lines: list[str] = field(default_factory=list)
 
 
+def _sheet_compare_issues(
+    *,
+    sheet_name: str,
+    expected: pd.DataFrame,
+    actual: pd.DataFrame,
+    max_lines: int,
+) -> tuple[int, list[str]]:
+    issues = 0
+    lines: list[str] = []
+    if len(expected) != len(actual):
+        issues += 1
+        lines.append(
+            f"  [{sheet_name}] row count mismatch: expected {len(expected)}, got {len(actual)}"
+        )
+
+    if list(expected.columns) != list(actual.columns):
+        issues += 1
+        lines.append(
+            f"  [{sheet_name}] column mismatch: expected {list(expected.columns)!r}, got {list(actual.columns)!r}"
+        )
+
+    common_cols = [c for c in expected.columns if c in actual.columns]
+    nrows = min(len(expected), len(actual))
+    for i in range(nrows):
+        for col in common_cols:
+            if col in ec.DIARY_COLS:
+                e = _norm_diary_value(col, expected.iloc[i][col])
+                a = _norm_diary_value(col, actual.iloc[i][col])
+            else:
+                e = _norm_cell(expected.iloc[i][col])
+                a = _norm_cell(actual.iloc[i][col])
+            if e != a:
+                issues += 1
+                if len(lines) < max_lines:
+                    lines.append(
+                        f"  [{sheet_name}] row {i} {col!r}: expected {e!r}, file has {a!r}"
+                    )
+    return issues, lines
+
+
+def _summary_issues(
+    *,
+    expected: pd.DataFrame,
+    actual: pd.DataFrame,
+    max_lines: int,
+) -> tuple[int, list[str]]:
+    issues = 0
+    lines: list[str] = []
+    rows, cols = expected.shape
+    for r in range(rows):
+        for c in range(cols):
+            e = _norm_cell(expected.iat[r, c])
+            if e == "":
+                continue
+            a = ""
+            if r < actual.shape[0] and c < actual.shape[1]:
+                a = _norm_cell(actual.iat[r, c])
+            if e != a:
+                issues += 1
+                if len(lines) < max_lines:
+                    lines.append(
+                        f"  [{ec.SHEET_SUMMARY}] cell R{r + 1}C{c + 1}: expected {e!r}, file has {a!r}"
+                    )
+    return issues, lines
+
+
+def _read_sheet_raw_values(
+    *,
+    workbook_path: Path,
+    sheet_name: str,
+    rows: int,
+    cols: int,
+) -> pd.DataFrame:
+    wb = load_workbook(workbook_path, data_only=False, read_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return pd.DataFrame()
+        ws = wb[sheet_name]
+        raw: list[list[object]] = []
+        for r in range(1, rows + 1):
+            row: list[object] = []
+            for c in range(1, cols + 1):
+                row.append(ws.cell(row=r, column=c).value)
+            raw.append(row)
+        return pd.DataFrame(raw)
+    finally:
+        wb.close()
+
+
 def verify(
     *,
     diary_path: Path,
@@ -97,8 +190,19 @@ def verify(
             clarity[c] = ""
 
     expected = ec.enrich_clarity(clarity, diary)
+    expected_filtered = ec.build_filtered_sheets(expected)
+    expected_summary = ec.build_summary_sheet(
+        total=len(expected),
+        on_land=len(expected_filtered[ec.SHEET_ON_LAND]),
+        at_sea=len(expected_filtered[ec.SHEET_AT_SEA]),
+        at_sea_at_work=len(expected_filtered[ec.SHEET_AT_SEA_AT_WORK]),
+    )
     say(term.dim("  Loading enriched workbook…"))
-    actual = pd.read_excel(enriched_path, engine="openpyxl")
+    workbook = pd.ExcelFile(enriched_path, engine="openpyxl")
+    if ec.SHEET_ENRICHED in workbook.sheet_names:
+        actual = pd.read_excel(workbook, sheet_name=ec.SHEET_ENRICHED)
+    else:
+        actual = pd.read_excel(workbook, sheet_name=workbook.sheet_names[0])
 
     if len(expected) != len(actual):
         say()
@@ -117,6 +221,7 @@ def verify(
     lines_printed = 0
     mismatch_lines: list[str] = []
     last_pct = -1
+    progress_printed = False
 
     for i in range(total):
         row_issues: list[tuple[str, str, str]] = []
@@ -136,6 +241,7 @@ def verify(
                     lines_printed += 1
 
         # Progress only on a real TTY so logs (make, pipes) stay short.
+        # Redraw in-place: CR + clear line (ANSI) avoids stacking lines in normal terminals.
         if show_progress and total >= 50 and sys.stdout.isatty():
             pct = 100 * (i + 1) // total
             if pct != last_pct:
@@ -143,26 +249,73 @@ def verify(
                 filled = int(bar_w * (i + 1) / total)
                 bar = "█" * filled + "░" * (bar_w - filled)
                 if term.enabled:
-                    msg = f"\r  {term.cyan('Comparing')}{term.dim('…')} [{bar}] {pct:>3}%"
+                    msg = f"  {term.cyan('Comparing')}{term.dim('…')} [{bar}] {pct:>3}%"
                 else:
-                    msg = f"\r  Comparing... [{bar}] {pct:>3}%"
-                print(msg, end="", flush=True)
+                    msg = f"  Comparing… [{bar}] {pct:>3}%"
+                sys.stdout.write("\r\033[2K" + msg)
+                sys.stdout.flush()
                 last_pct = pct
+                progress_printed = True
 
-    if show_progress and total >= 50 and sys.stdout.isatty():
+    if progress_printed:
         print()
 
     ok_rows = total - bad_rows
     pct_ok = (100.0 * ok_rows / total) if total else 100.0
 
+    extra_issues = 0
+    for sheet_name in (ec.SHEET_AT_SEA, ec.SHEET_AT_SEA_AT_WORK, ec.SHEET_ON_LAND):
+        if sheet_name not in workbook.sheet_names:
+            extra_issues += 1
+            if lines_printed < max_report:
+                mismatch_lines.append(f"  Missing required sheet: {sheet_name!r}")
+                lines_printed += 1
+            continue
+        act = pd.read_excel(workbook, sheet_name=sheet_name)
+        rem = max(max_report - lines_printed, 0)
+        issues, lines = _sheet_compare_issues(
+            sheet_name=sheet_name,
+            expected=expected_filtered[sheet_name],
+            actual=act,
+            max_lines=rem,
+        )
+        extra_issues += issues
+        mismatch_lines.extend(lines)
+        lines_printed += len(lines)
+
+    if ec.SHEET_SUMMARY not in workbook.sheet_names:
+        extra_issues += 1
+        if lines_printed < max_report:
+            mismatch_lines.append(f"  Missing required sheet: {ec.SHEET_SUMMARY!r}")
+            lines_printed += 1
+    else:
+        act_summary = _read_sheet_raw_values(
+            workbook_path=enriched_path,
+            sheet_name=ec.SHEET_SUMMARY,
+            rows=expected_summary.shape[0],
+            cols=expected_summary.shape[1],
+        )
+        rem = max(max_report - lines_printed, 0)
+        issues, lines = _summary_issues(
+            expected=expected_summary,
+            actual=act_summary,
+            max_lines=rem,
+        )
+        extra_issues += issues
+        mismatch_lines.extend(lines)
+        lines_printed += len(lines)
+
+    total_issues = bad_rows + extra_issues
+
     say()
     say(f"  {term.dim('Rows checked:')}  {total:,}")
-    ok_part = term.green(f"{ok_rows:,} ok") if bad_rows == 0 else f"{ok_rows:,} ok"
-    fail_part = term.red(f"{bad_rows:,} failed") if bad_rows else term.dim("0 failed")
+    say(f"  {term.dim('Extra checks:')}  filtered sheets + summary")
+    ok_part = term.green(f"{ok_rows:,} ok") if total_issues == 0 else f"{ok_rows:,} ok"
+    fail_part = term.red(f"{total_issues:,} failed") if total_issues else term.dim("0 failed")
     say(f"  {term.dim('Match rate:')}   {pct_ok:>6.2f}%  ({ok_part}, {fail_part})")
     say()
 
-    if bad_rows:
+    if total_issues:
         say(term.yellow(term.bold(f"  Sample mismatches (up to {max_report} lines):")))
         for ln in mismatch_lines:
             say(term.red(ln))

@@ -22,6 +22,11 @@ CLARITY_PREFIX = "Clarity_Export"
 
 CLARITY_TS_COL = TIMESTAMP_COL
 DIARY_COLS = ["At Sea", "At Work", "Glucose Issue"]
+SHEET_ENRICHED = "enriched"
+SHEET_AT_SEA = "At see"
+SHEET_AT_SEA_AT_WORK = "At see at work"
+SHEET_ON_LAND = "On land"
+SHEET_SUMMARY = "summary"
 
 
 def _bool_diary_format(s: pd.Series) -> pd.Series:
@@ -43,6 +48,88 @@ def _require_excel_out(path: str, label: str) -> None:
     suf = Path(path).suffix.lower()
     if suf not in (".xlsx", ".xlsm"):
         raise ValueError(f"{label} must be .xlsx or .xlsm, got {path!r}")
+
+
+def _to_bool_state(x) -> bool | None:
+    if pd.isna(x):
+        return None
+    if isinstance(x, (bool, int)):
+        return bool(x)
+    if isinstance(x, float):
+        if pd.isna(x):
+            return None
+        if x == 1.0:
+            return True
+        if x == 0.0:
+            return False
+    s = str(x).strip().upper()
+    if s in ("TRUE", "YES", "1"):
+        return True
+    if s in ("FALSE", "NO", "0"):
+        return False
+    return None
+
+
+def _bool_mask(s: pd.Series, state: bool) -> pd.Series:
+    target = state
+    return s.map(_to_bool_state).map(lambda v: v is target)
+
+
+def build_filtered_sheets(enriched: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    at_sea_mask = _bool_mask(enriched["At Sea"], True)
+    at_work_mask = _bool_mask(enriched["At Work"], True)
+    on_land_mask = _bool_mask(enriched["At Sea"], False)
+
+    at_sea = enriched.loc[at_sea_mask].copy()
+    at_sea_at_work = enriched.loc[at_sea_mask & at_work_mask].copy()
+    on_land = enriched.loc[on_land_mask].copy()
+
+    return {
+        SHEET_AT_SEA: at_sea,
+        SHEET_AT_SEA_AT_WORK: at_sea_at_work,
+        SHEET_ON_LAND: on_land,
+    }
+
+
+def build_summary_sheet(
+    *,
+    total: int,
+    on_land: int,
+    at_sea: int,
+    at_sea_at_work: int,
+) -> pd.DataFrame:
+    rows = [[""] * 7 for _ in range(11)]
+    rows[1][2] = "all"
+    rows[1][3] = "on land"
+    rows[1][4] = "at sea"
+    rows[1][5] = "at sea on duty"
+
+    rows[2][1] = "Data lines"
+    rows[2][2] = str(total)
+    rows[2][3] = str(on_land)
+    rows[2][4] = str(at_sea)
+    rows[2][5] = str(at_sea_at_work)
+
+    rows[5][2] = "Data lines"
+    rows[5][3] = "% of all"
+
+    rows[6][1] = "all"
+    rows[6][2] = str(total)
+    rows[6][3] = "100"
+
+    rows[7][1] = "on land"
+    rows[7][2] = str(on_land)
+    rows[7][3] = "=C8*100/C7"
+
+    rows[8][1] = "at sea"
+    rows[8][2] = str(at_sea)
+    rows[8][3] = "=C9*100/C7"
+
+    rows[9][1] = "at sea on duty"
+    rows[9][2] = str(at_sea_at_work)
+    rows[9][3] = "=C10*100/C7"
+
+    return pd.DataFrame(rows)
 
 
 def enrich_clarity(clarity: pd.DataFrame, diary: pd.DataFrame) -> pd.DataFrame:
@@ -208,14 +295,35 @@ def main() -> None:
 
     print(term.dim("  Merging (merge_asof backward on timestamps)…"))
     enriched = enrich_clarity(clarity, diary)
-    print(term.dim("  Writing enriched workbook…"))
+    filtered = build_filtered_sheets(enriched)
+    summary_df = build_summary_sheet(
+        total=len(enriched),
+        on_land=len(filtered[SHEET_ON_LAND]),
+        at_sea=len(filtered[SHEET_AT_SEA]),
+        at_sea_at_work=len(filtered[SHEET_AT_SEA_AT_WORK]),
+    )
+
+    print(term.dim("  Writing enriched workbook (enriched + 4 extra sheets)…"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    enriched.to_excel(out_path, index=False, engine="openpyxl")
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        enriched.to_excel(writer, sheet_name=SHEET_ENRICHED, index=False)
+        filtered[SHEET_AT_SEA].to_excel(writer, sheet_name=SHEET_AT_SEA, index=False)
+        filtered[SHEET_AT_SEA_AT_WORK].to_excel(
+            writer, sheet_name=SHEET_AT_SEA_AT_WORK, index=False
+        )
+        filtered[SHEET_ON_LAND].to_excel(writer, sheet_name=SHEET_ON_LAND, index=False)
+        summary_df.to_excel(writer, sheet_name=SHEET_SUMMARY, index=False, header=False)
 
     n = len(enriched)
     with_ts = pd.to_datetime(enriched[CLARITY_TS_COL], errors="coerce").notna().sum()
     print()
     print(f"  {term.dim('Output rows:')}   {n:,}  ({term.dim('with timestamp:')} {int(with_ts):,})")
+    print(
+        f"  {term.dim('Segments:')}      "
+        f"at sea={len(filtered[SHEET_AT_SEA]):,}, "
+        f"at sea+work={len(filtered[SHEET_AT_SEA_AT_WORK]):,}, "
+        f"on land={len(filtered[SHEET_ON_LAND]):,}"
+    )
     print()
     print(term.green(term.bold("  ✓ DONE")))
     print(term.green(f"  Wrote {out_path.name}"))
