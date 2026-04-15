@@ -81,6 +81,7 @@ def _sheet_compare_issues(
     expected: pd.DataFrame,
     actual: pd.DataFrame,
     max_lines: int,
+    progress_cb=None,
 ) -> tuple[int, list[str]]:
     issues = 0
     lines: list[str] = []
@@ -99,6 +100,8 @@ def _sheet_compare_issues(
     common_cols = [c for c in expected.columns if c in actual.columns]
     nrows = min(len(expected), len(actual))
     for i in range(nrows):
+        if progress_cb is not None:
+            progress_cb(i + 1, nrows)
         for col in common_cols:
             if col in ec.DIARY_COLS:
                 e = _norm_diary_value(col, expected.iloc[i][col])
@@ -120,11 +123,14 @@ def _summary_issues(
     expected: pd.DataFrame,
     actual: pd.DataFrame,
     max_lines: int,
+    progress_cb=None,
 ) -> tuple[int, list[str]]:
     issues = 0
     lines: list[str] = []
     rows, cols = expected.shape
     for r in range(rows):
+        if progress_cb is not None:
+            progress_cb(r + 1, rows)
         for c in range(cols):
             e = _norm_cell(expected.iat[r, c])
             if e == "":
@@ -147,6 +153,7 @@ def _read_sheet_raw_values(
     sheet_name: str,
     rows: int,
     cols: int,
+    progress_cb=None,
 ) -> pd.DataFrame:
     wb = load_workbook(workbook_path, data_only=False, read_only=True)
     try:
@@ -155,6 +162,8 @@ def _read_sheet_raw_values(
         ws = wb[sheet_name]
         raw: list[list[object]] = []
         for r in range(1, rows + 1):
+            if progress_cb is not None:
+                progress_cb(r, rows)
             row: list[object] = []
             for c in range(1, cols + 1):
                 row.append(ws.cell(row=r, column=c).value)
@@ -263,44 +272,112 @@ def verify(
     ok_rows = total - bad_rows
     pct_ok = (100.0 * ok_rows / total) if total else 100.0
 
+    say(term.dim("  Validating additional sheets…"))
+    inline_detail = show_progress and sys.stdout.isatty()
+
+    def draw_detail(msg: str) -> None:
+        if inline_detail:
+            sys.stdout.write("\r\033[2K" + msg)
+            sys.stdout.flush()
+        else:
+            say(msg)
+
+    def finish_detail_line() -> None:
+        if inline_detail:
+            print()
+
+    def format_detail_progress(label: str, pct: int) -> str:
+        bar_w = 24
+        filled = int(bar_w * pct / 100)
+        bar = "█" * filled + "░" * (bar_w - filled)
+        if term.enabled:
+            return f"      {term.cyan(label)}{term.dim('…')} [{bar}] {pct:>3}%"
+        return f"      {label}... [{bar}] {pct:>3}%"
+
     extra_issues = 0
     for sheet_name in (ec.SHEET_AT_SEA, ec.SHEET_AT_SEA_AT_WORK, ec.SHEET_ON_LAND):
+        say(term.dim(f"    - {sheet_name}"))
         if sheet_name not in workbook.sheet_names:
             extra_issues += 1
             if lines_printed < max_report:
                 mismatch_lines.append(f"  Missing required sheet: {sheet_name!r}")
                 lines_printed += 1
             continue
+        draw_detail(term.dim("      loading rows…"))
         act = pd.read_excel(workbook, sheet_name=sheet_name)
+        sheet_cmp_last = -1
+
+        def sheet_compare_progress(done: int, total_rows: int) -> None:
+            nonlocal sheet_cmp_last
+            if total_rows <= 0:
+                return
+            pct = int((100 * done) / total_rows)
+            if pct != sheet_cmp_last:
+                draw_detail(format_detail_progress("Comparing rows", pct))
+                sheet_cmp_last = pct
+
         rem = max(max_report - lines_printed, 0)
         issues, lines = _sheet_compare_issues(
             sheet_name=sheet_name,
             expected=expected_filtered[sheet_name],
             actual=act,
             max_lines=rem,
+            progress_cb=sheet_compare_progress if inline_detail else None,
         )
+        if inline_detail and sheet_cmp_last < 100:
+            draw_detail(format_detail_progress("Comparing rows", 100))
+        finish_detail_line()
         extra_issues += issues
         mismatch_lines.extend(lines)
         lines_printed += len(lines)
 
     if ec.SHEET_SUMMARY not in workbook.sheet_names:
+        say(term.dim(f"    - {ec.SHEET_SUMMARY}"))
         extra_issues += 1
         if lines_printed < max_report:
             mismatch_lines.append(f"  Missing required sheet: {ec.SHEET_SUMMARY!r}")
             lines_printed += 1
     else:
+        say(term.dim(f"    - {ec.SHEET_SUMMARY}"))
+        summary_load_last = -1
+
+        def summary_load_progress(done: int, total_rows: int) -> None:
+            nonlocal summary_load_last
+            if total_rows <= 0:
+                return
+            pct = int((100 * done) / total_rows)
+            if pct != summary_load_last:
+                draw_detail(format_detail_progress("Loading cells", pct))
+                summary_load_last = pct
+
         act_summary = _read_sheet_raw_values(
             workbook_path=enriched_path,
             sheet_name=ec.SHEET_SUMMARY,
             rows=expected_summary.shape[0],
             cols=expected_summary.shape[1],
+            progress_cb=summary_load_progress if inline_detail else None,
         )
+        summary_cmp_last = -1
+
+        def summary_compare_progress(done: int, total_rows: int) -> None:
+            nonlocal summary_cmp_last
+            if total_rows <= 0:
+                return
+            pct = int((100 * done) / total_rows)
+            if pct != summary_cmp_last:
+                draw_detail(format_detail_progress("Comparing cells", pct))
+                summary_cmp_last = pct
+
         rem = max(max_report - lines_printed, 0)
         issues, lines = _summary_issues(
             expected=expected_summary,
             actual=act_summary,
             max_lines=rem,
+            progress_cb=summary_compare_progress if inline_detail else None,
         )
+        if inline_detail and summary_cmp_last < 100:
+            draw_detail(format_detail_progress("Comparing cells", 100))
+        finish_detail_line()
         extra_issues += issues
         mismatch_lines.extend(lines)
         lines_printed += len(lines)
